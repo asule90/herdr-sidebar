@@ -1283,6 +1283,7 @@ impl App {
                 self.scroll = 0;
                 self.rebuild();
             }
+            TitleAction::ViewAsTree | TitleAction::ViewAsList => {}
         }
     }
 

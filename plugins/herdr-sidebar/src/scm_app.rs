@@ -273,6 +273,176 @@ fn drawer_spec(dref: &DrawerRef) -> Option<String> {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DirEntry {
+    path: String,
+    name: String,
+    depth: usize,
+    expanded: bool,
+    count: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TreeItem {
+    Dir(usize),
+    File(usize),
+}
+
+#[derive(Clone, Debug)]
+struct ScmTreeNode {
+    name: String,
+    path: String,
+    is_dir: bool,
+    file_index: Option<usize>,
+    children: Vec<ScmTreeNode>,
+}
+
+impl ScmTreeNode {
+    fn new_dir(name: String, path: String) -> Self {
+        Self {
+            name,
+            path,
+            is_dir: true,
+            file_index: None,
+            children: Vec::new(),
+        }
+    }
+
+    fn new_file(name: String, path: String, file_index: usize) -> Self {
+        Self {
+            name,
+            path,
+            is_dir: false,
+            file_index: Some(file_index),
+            children: Vec::new(),
+        }
+    }
+
+    fn add_path(&mut self, components: &[&str], full_path: &str, file_index: usize) {
+        if components.is_empty() {
+            return;
+        }
+        if components.len() == 1 {
+            self.children.push(ScmTreeNode::new_file(
+                components[0].to_string(),
+                full_path.to_string(),
+                file_index,
+            ));
+            return;
+        }
+        let dir_name = components[0];
+        let sub_path = if self.path.is_empty() {
+            dir_name.to_string()
+        } else {
+            format!("{}/{}", self.path, dir_name)
+        };
+        if let Some(pos) = self.children.iter().position(|c| c.is_dir && c.name == dir_name) {
+            self.children[pos].add_path(&components[1..], full_path, file_index);
+        } else {
+            let mut new_dir = ScmTreeNode::new_dir(dir_name.to_string(), sub_path);
+            new_dir.add_path(&components[1..], full_path, file_index);
+            self.children.push(new_dir);
+        }
+    }
+
+    fn compact(&mut self) {
+        for child in &mut self.children {
+            child.compact();
+        }
+        if self.is_dir && self.children.len() == 1 && self.children[0].is_dir {
+            let only_child = self.children.remove(0);
+            self.name = format!("{}/{}", self.name, only_child.name);
+            self.path = only_child.path;
+            self.children = only_child.children;
+        }
+    }
+
+    fn sort(&mut self) {
+        for child in &mut self.children {
+            child.sort();
+        }
+        self.children.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        });
+    }
+
+    fn file_count(&self) -> usize {
+        if !self.is_dir {
+            1
+        } else {
+            self.children.iter().map(|c| c.file_count()).sum()
+        }
+    }
+}
+
+fn build_tree_model(
+    files: &[FileEntry],
+    collapsed_dirs: &std::collections::BTreeSet<String>,
+) -> (Vec<DirEntry>, Vec<usize>, Vec<TreeItem>) {
+    let mut root = ScmTreeNode::new_dir(String::new(), String::new());
+    for (i, entry) in files.iter().enumerate() {
+        let parts: Vec<&str> = entry.path.split('/').filter(|s| !s.is_empty()).collect();
+        root.add_path(&parts, &entry.path, i);
+    }
+    root.sort();
+    for child in &mut root.children {
+        child.compact();
+    }
+    let mut dirs = Vec::new();
+    let mut depths = vec![0; files.len()];
+    let mut rows = Vec::new();
+    flatten_scm_tree(
+        &root.children,
+        0,
+        collapsed_dirs,
+        &mut dirs,
+        &mut depths,
+        &mut rows,
+    );
+    (dirs, depths, rows)
+}
+
+fn flatten_scm_tree(
+    nodes: &[ScmTreeNode],
+    depth: usize,
+    collapsed_dirs: &std::collections::BTreeSet<String>,
+    dirs_out: &mut Vec<DirEntry>,
+    file_depths_out: &mut [usize],
+    rows_out: &mut Vec<TreeItem>,
+) {
+    for node in nodes {
+        if node.is_dir {
+            let expanded = !collapsed_dirs.contains(&node.path);
+            let dir_idx = dirs_out.len();
+            dirs_out.push(DirEntry {
+                path: node.path.clone(),
+                name: node.name.clone(),
+                depth,
+                expanded,
+                count: node.file_count(),
+            });
+            rows_out.push(TreeItem::Dir(dir_idx));
+            if expanded {
+                flatten_scm_tree(
+                    &node.children,
+                    depth + 1,
+                    collapsed_dirs,
+                    dirs_out,
+                    file_depths_out,
+                    rows_out,
+                );
+            }
+        } else if let Some(idx) = node.file_index {
+            if idx < file_depths_out.len() {
+                file_depths_out[idx] = depth;
+            }
+            rows_out.push(TreeItem::File(idx));
+        }
+    }
+}
+
 /// One discovered repository and its per-repo view state — including its own
 /// commit message, so the multi-repo view mirrors VS Code's per-repo inputs.
 struct Repo {
@@ -284,6 +454,14 @@ struct Repo {
     changes_collapsed: bool,
     message: Vec<char>,
     cursor: usize,
+    staged_dirs: Vec<DirEntry>,
+    changes_dirs: Vec<DirEntry>,
+    staged_file_depths: Vec<usize>,
+    changes_file_depths: Vec<usize>,
+    staged_tree_rows: Vec<TreeItem>,
+    changes_tree_rows: Vec<TreeItem>,
+    staged_collapsed_dirs: std::collections::BTreeSet<String>,
+    changes_collapsed_dirs: std::collections::BTreeSet<String>,
 }
 
 impl Repo {
@@ -297,7 +475,29 @@ impl Repo {
             changes_collapsed: false,
             message: Vec::new(),
             cursor: 0,
+            staged_dirs: Vec::new(),
+            changes_dirs: Vec::new(),
+            staged_file_depths: Vec::new(),
+            changes_file_depths: Vec::new(),
+            staged_tree_rows: Vec::new(),
+            changes_tree_rows: Vec::new(),
+            staged_collapsed_dirs: std::collections::BTreeSet::new(),
+            changes_collapsed_dirs: std::collections::BTreeSet::new(),
         }
+    }
+
+    fn build_trees(&mut self) {
+        let (dirs, depths, rows) =
+            build_tree_model(&self.status.staged, &self.staged_collapsed_dirs);
+        self.staged_dirs = dirs;
+        self.staged_file_depths = depths;
+        self.staged_tree_rows = rows;
+
+        let (dirs, depths, rows) =
+            build_tree_model(&self.status.unstaged, &self.changes_collapsed_dirs);
+        self.changes_dirs = dirs;
+        self.changes_file_depths = depths;
+        self.changes_tree_rows = rows;
     }
 
     /// The repo row's branch decoration: `name*` when the tree is dirty.
@@ -326,6 +526,8 @@ enum Row {
     Commit(usize),
     StagedHeader(usize),
     ChangesHeader(usize),
+    StagedDir(usize, usize),
+    ChangesDir(usize, usize),
     Staged(usize, usize),
     Unstaged(usize, usize),
     DrawerHeader(Drawer),
@@ -341,6 +543,8 @@ impl Row {
             | Row::Commit(r)
             | Row::StagedHeader(r)
             | Row::ChangesHeader(r)
+            | Row::StagedDir(r, _)
+            | Row::ChangesDir(r, _)
             | Row::Staged(r, _)
             | Row::Unstaged(r, _) => Some(r),
             Row::DrawerHeader(_) | Row::DrawerLine(..) => None,
@@ -495,6 +699,7 @@ enum Setting {
     GitFooter,
     Hotkeys,
     Folder,
+    ScmViewMode,
 }
 
 /// (setting, label, current value, enabled) — disabled rows render dimmed and
@@ -707,6 +912,7 @@ pub struct App {
     /// newer draft it never observed.
     persisted_draft_roots: std::collections::BTreeSet<String>,
     pending_unified_width: Option<(u16, std::time::Instant)>,
+    pub tree_view: bool,
 }
 
 const MY_VIEW: View = View::SourceControl;
@@ -745,6 +951,7 @@ impl App {
         // explorer's tree-state restore.
         let saved = sidebar::load_scm_state(&cwd);
         let persisted_draft_roots = saved.drafts.keys().cloned().collect();
+        let tree_view = saved.tree_view.unwrap_or(sidebar_state.scm_tree_view);
         let mut drawers: [DrawerPanel; 8] = Default::default();
         for kind in Drawer::ALL {
             drawers[kind.index()].expanded = saved.drawers.iter().any(|d| d == kind.title());
@@ -767,6 +974,10 @@ impl App {
             if let Some(message) = saved.drafts.get(&root) {
                 repo.message = message.chars().collect();
                 repo.cursor = repo.message.len();
+            }
+            for dir in &saved.collapsed_dirs {
+                repo.staged_collapsed_dirs.insert(dir.clone());
+                repo.changes_collapsed_dirs.insert(dir.clone());
             }
         }
 
@@ -807,6 +1018,7 @@ impl App {
             cwd_follower,
             persisted_draft_roots,
             pending_unified_width: None,
+            tree_view,
         };
         app.apply_identity();
         app.refresh();
@@ -1091,6 +1303,12 @@ impl App {
             }
             repo.staged_collapsed = true;
             repo.changes_collapsed = true;
+            if self.tree_view {
+                repo.staged_collapsed_dirs
+                    .extend(repo.staged_dirs.iter().map(|d| d.path.clone()));
+                repo.changes_collapsed_dirs
+                    .extend(repo.changes_dirs.iter().map(|d| d.path.clone()));
+            }
         }
         for drawer in &mut self.drawers {
             drawer.expanded = false;
@@ -1152,6 +1370,11 @@ impl App {
     fn rebuild(&mut self) {
         self.rows.clear();
         let multi = self.repos.len() > 1;
+        if self.tree_view {
+            for repo in &mut self.repos {
+                repo.build_trees();
+            }
+        }
         for (r, repo) in self.repos.iter().enumerate() {
             if multi {
                 self.rows.push(Row::RepoHeader(r));
@@ -1167,15 +1390,33 @@ impl App {
             if !repo.status.staged.is_empty() {
                 self.rows.push(Row::StagedHeader(r));
                 if !repo.staged_collapsed {
-                    for i in 0..repo.status.staged.len() {
-                        self.rows.push(Row::Staged(r, i));
+                    if self.tree_view {
+                        for item in &repo.staged_tree_rows {
+                            match item {
+                                TreeItem::Dir(d) => self.rows.push(Row::StagedDir(r, *d)),
+                                TreeItem::File(i) => self.rows.push(Row::Staged(r, *i)),
+                            }
+                        }
+                    } else {
+                        for i in 0..repo.status.staged.len() {
+                            self.rows.push(Row::Staged(r, i));
+                        }
                     }
                 }
             }
             self.rows.push(Row::ChangesHeader(r));
             if !repo.changes_collapsed {
-                for i in 0..repo.status.unstaged.len() {
-                    self.rows.push(Row::Unstaged(r, i));
+                if self.tree_view {
+                    for item in &repo.changes_tree_rows {
+                        match item {
+                            TreeItem::Dir(d) => self.rows.push(Row::ChangesDir(r, *d)),
+                            TreeItem::File(i) => self.rows.push(Row::Unstaged(r, *i)),
+                        }
+                    }
+                } else {
+                    for i in 0..repo.status.unstaged.len() {
+                        self.rows.push(Row::Unstaged(r, i));
+                    }
                 }
             }
         }
@@ -1399,6 +1640,7 @@ impl App {
             KeyCode::Home | KeyCode::Char('g') => self.select(0),
             KeyCode::End | KeyCode::Char('G') => self.select(self.rows.len().saturating_sub(1)),
             KeyCode::Enter | KeyCode::Char(' ') => self.activate(),
+            KeyCode::Char('t') => self.toggle_tree_view(),
             KeyCode::Char('a') => self.stage_all(),
             KeyCode::Char('u') => self.unstage_all(),
             KeyCode::Char('r') => self.refresh(),
@@ -1470,6 +1712,7 @@ impl App {
         }
         if let Some(&(_, action)) = self.title_zones.iter().find(|(rect, _)| hits(*rect, x, y)) {
             match action {
+                TitleAction::ViewAsTree | TitleAction::ViewAsList => self.toggle_tree_view(),
                 TitleAction::Refresh => self.refresh(),
                 TitleAction::CollapseAll => self.collapse_all(),
                 _ => {}
@@ -1512,6 +1755,30 @@ impl App {
                 .is_some_and(|(i, at)| i == index && now.duration_since(at) < DOUBLE_CLICK);
             self.last_click = Some((index, now));
             match self.rows[index] {
+                Row::StagedDir(r, d) => {
+                    self.focus = Focus::List;
+                    self.select(index);
+                    if let Some(dir) = self.repos.get(r).and_then(|repo| repo.staged_dirs.get(d)).cloned() {
+                        let action = dir_hover_action_at(x, self.last_width, true, dir.count);
+                        if action == Some(FileHoverAction::Unstage) {
+                            self.unstage_dir(r, &dir.path);
+                        } else {
+                            self.toggle_staged_dir(r, d);
+                        }
+                    }
+                }
+                Row::ChangesDir(r, d) => {
+                    self.focus = Focus::List;
+                    self.select(index);
+                    if let Some(dir) = self.repos.get(r).and_then(|repo| repo.changes_dirs.get(d)).cloned() {
+                        let action = dir_hover_action_at(x, self.last_width, false, dir.count);
+                        if action == Some(FileHoverAction::Stage) {
+                            self.stage_dir(r, &dir.path);
+                        } else {
+                            self.toggle_changes_dir(r, d);
+                        }
+                    }
+                }
                 // Clicking a changed file shows its diff, like VS Code. Hover
                 // actions open, discard, stage, or unstage that exact entry.
                 Row::Staged(r, i) => {
@@ -2146,6 +2413,12 @@ impl App {
                 true,
             ),
             (
+                Setting::ScmViewMode,
+                "View as",
+                if self.tree_view { "tree" } else { "list" }.to_string(),
+                true,
+            ),
+            (
                 Setting::Folder,
                 "Change folder…",
                 self.cwd
@@ -2165,6 +2438,7 @@ impl App {
             return;
         }
         match setting {
+            Setting::ScmViewMode => self.toggle_tree_view(),
             Setting::UnifiedSidebar => {
                 // The pane layout changes underneath the modal; close it.
                 self.overlay = None;
@@ -2702,6 +2976,16 @@ impl App {
                 .repos
                 .get(*r)
                 .map(|r| format!("changes-h:{}", r.git.root().display())),
+            Row::StagedDir(r, d) => self.repos.get(*r).and_then(|repo| {
+                repo.staged_dirs
+                    .get(*d)
+                    .map(|dir| format!("staged-dir:{}:{}", repo.git.root().display(), dir.path))
+            }),
+            Row::ChangesDir(r, d) => self.repos.get(*r).and_then(|repo| {
+                repo.changes_dirs
+                    .get(*d)
+                    .map(|dir| format!("changes-dir:{}:{}", repo.git.root().display(), dir.path))
+            }),
             Row::Staged(r, i) => self.repos.get(*r).and_then(|repo| {
                 repo.status
                     .staged
@@ -2763,6 +3047,11 @@ impl App {
             .filter(|root| visible_roots.contains(*root) && !drafts.contains_key(*root))
             .cloned()
             .collect();
+        let mut collapsed_dirs = Vec::new();
+        for repo in &self.repos {
+            collapsed_dirs.extend(repo.staged_collapsed_dirs.iter().cloned());
+            collapsed_dirs.extend(repo.changes_collapsed_dirs.iter().cloned());
+        }
         sidebar::ScmState {
             drawers,
             active_root,
@@ -2771,6 +3060,8 @@ impl App {
             scroll: self.scroll,
             drafts,
             cleared_drafts,
+            tree_view: Some(self.tree_view),
+            collapsed_dirs,
         }
     }
 
@@ -3024,6 +3315,8 @@ impl App {
                 self.reload_expanded_drawers();
                 self.rebuild();
             }
+            Row::StagedDir(r, d) => self.toggle_staged_dir(r, d),
+            Row::ChangesDir(r, d) => self.toggle_changes_dir(r, d),
             Row::Staged(r, i) => self.run_op(|git, e| git.unstage(e), r, i, true),
             Row::Unstaged(r, i) => self.run_op(|git, e| git.stage(e), r, i, false),
         }
@@ -3068,6 +3361,89 @@ impl App {
         };
         if let Err(e) = repo.git.unstage_all() {
             self.flash = Some((e, true));
+        }
+        self.refresh();
+    }
+
+    pub fn toggle_tree_view(&mut self) {
+        self.tree_view = !self.tree_view;
+        self.sidebar_state = sidebar::update_state(|state| {
+            state.scm_tree_view = self.tree_view;
+        });
+        self.rebuild();
+        self.persist_scm();
+    }
+
+    fn toggle_staged_dir(&mut self, repo_idx: usize, dir_idx: usize) {
+        let Some(repo) = self.repos.get_mut(repo_idx) else {
+            return;
+        };
+        if let Some(dir) = repo.staged_dirs.get(dir_idx) {
+            let path = dir.path.clone();
+            if repo.staged_collapsed_dirs.contains(&path) {
+                repo.staged_collapsed_dirs.remove(&path);
+            } else {
+                repo.staged_collapsed_dirs.insert(path);
+            }
+        }
+        self.rebuild();
+        self.persist_scm();
+    }
+
+    fn toggle_changes_dir(&mut self, repo_idx: usize, dir_idx: usize) {
+        let Some(repo) = self.repos.get_mut(repo_idx) else {
+            return;
+        };
+        if let Some(dir) = repo.changes_dirs.get(dir_idx) {
+            let path = dir.path.clone();
+            if repo.changes_collapsed_dirs.contains(&path) {
+                repo.changes_collapsed_dirs.remove(&path);
+            } else {
+                repo.changes_collapsed_dirs.insert(path);
+            }
+        }
+        self.rebuild();
+        self.persist_scm();
+    }
+
+    fn stage_dir(&mut self, repo_idx: usize, dir_path: &str) {
+        let Some(repo) = self.repos.get(repo_idx) else {
+            return;
+        };
+        let prefix = format!("{dir_path}/");
+        let entries: Vec<FileEntry> = repo
+            .status
+            .unstaged
+            .iter()
+            .filter(|e| e.path == dir_path || e.path.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for entry in entries {
+            if let Err(e) = repo.git.stage(&entry) {
+                self.flash = Some((e, true));
+                break;
+            }
+        }
+        self.refresh();
+    }
+
+    fn unstage_dir(&mut self, repo_idx: usize, dir_path: &str) {
+        let Some(repo) = self.repos.get(repo_idx) else {
+            return;
+        };
+        let prefix = format!("{dir_path}/");
+        let entries: Vec<FileEntry> = repo
+            .status
+            .staged
+            .iter()
+            .filter(|e| e.path == dir_path || e.path.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for entry in entries {
+            if let Err(e) = repo.git.unstage(&entry) {
+                self.flash = Some((e, true));
+                break;
+            }
         }
         self.refresh();
     }
@@ -3219,6 +3595,24 @@ impl App {
             Row::ChangesHeader(repo) => {
                 changes_header_action_at(x, self.last_width, self.repos[repo].status.unstaged.len())
                     .map(ChangesHeaderAction::footer_hint)
+            }
+            Row::StagedDir(repo, dir_idx) => {
+                let count = self
+                    .repos
+                    .get(repo)
+                    .and_then(|r| r.staged_dirs.get(dir_idx))
+                    .map_or(0, |d| d.count);
+                dir_hover_action_at(x, self.last_width, true, count)
+                    .map(FileHoverAction::footer_hint)
+            }
+            Row::ChangesDir(repo, dir_idx) => {
+                let count = self
+                    .repos
+                    .get(repo)
+                    .and_then(|r| r.changes_dirs.get(dir_idx))
+                    .map_or(0, |d| d.count);
+                dir_hover_action_at(x, self.last_width, false, count)
+                    .map(FileHoverAction::footer_hint)
             }
             Row::Staged(..) => {
                 file_hover_action_at(x, self.last_width, true).map(FileHoverAction::footer_hint)
@@ -3526,7 +3920,12 @@ impl App {
         // The hover title-action buttons sit just left of the gear.
         self.title_zones.clear();
         let (action_spans, actions_w) = if title_actions_visible(self.last_mouse) {
-            let actions = [TitleAction::Refresh, TitleAction::CollapseAll];
+            let view_action = if self.tree_view {
+                TitleAction::ViewAsList
+            } else {
+                TitleAction::ViewAsTree
+            };
+            let actions = [view_action, TitleAction::Refresh, TitleAction::CollapseAll];
             let w = title_actions_width(self.theme, &actions);
             let ax = area.x + area.width.saturating_sub(gear_w as u16 + w);
             let (spans, zones) =
@@ -3790,6 +4189,42 @@ impl App {
                     Row::DrawerLine(kind, i) => {
                         drawer_line(kind, &self.drawers[kind.index()].lines[i])
                     }
+                    Row::StagedDir(r, d) => {
+                        let dir = &self.repos[r].staged_dirs[d];
+                        let hovered_action = row_hovered
+                            .then(|| {
+                                mouse_pos.and_then(|(x, _)| {
+                                    dir_hover_action_at(x, width as u16, true, dir.count)
+                                })
+                            })
+                            .flatten();
+                        tree_dir_item(
+                            dir,
+                            width,
+                            theme,
+                            true,
+                            row_hovered,
+                            hovered_action,
+                        )
+                    }
+                    Row::ChangesDir(r, d) => {
+                        let dir = &self.repos[r].changes_dirs[d];
+                        let hovered_action = row_hovered
+                            .then(|| {
+                                mouse_pos.and_then(|(x, _)| {
+                                    dir_hover_action_at(x, width as u16, false, dir.count)
+                                })
+                            })
+                            .flatten();
+                        tree_dir_item(
+                            dir,
+                            width,
+                            theme,
+                            false,
+                            row_hovered,
+                            hovered_action,
+                        )
+                    }
                     Row::Staged(r, i) => {
                         let hovered_action = row_hovered
                             .then(|| {
@@ -3797,14 +4232,27 @@ impl App {
                                     .and_then(|(x, _)| file_hover_action_at(x, width as u16, true))
                             })
                             .flatten();
-                        file_item(
-                            &self.repos[r].status.staged[i],
-                            width,
-                            theme,
-                            true,
-                            row_hovered,
-                            hovered_action,
-                        )
+                        if self.tree_view {
+                            let depth = self.repos[r].staged_file_depths.get(i).copied().unwrap_or(0);
+                            tree_file_item(
+                                &self.repos[r].status.staged[i],
+                                depth,
+                                width,
+                                theme,
+                                true,
+                                row_hovered,
+                                hovered_action,
+                            )
+                        } else {
+                            file_item(
+                                &self.repos[r].status.staged[i],
+                                width,
+                                theme,
+                                true,
+                                row_hovered,
+                                hovered_action,
+                            )
+                        }
                     }
                     Row::Unstaged(r, i) => {
                         let hovered_action = row_hovered
@@ -3813,14 +4261,27 @@ impl App {
                                     .and_then(|(x, _)| file_hover_action_at(x, width as u16, false))
                             })
                             .flatten();
-                        file_item(
-                            &self.repos[r].status.unstaged[i],
-                            width,
-                            theme,
-                            false,
-                            row_hovered,
-                            hovered_action,
-                        )
+                        if self.tree_view {
+                            let depth = self.repos[r].changes_file_depths.get(i).copied().unwrap_or(0);
+                            tree_file_item(
+                                &self.repos[r].status.unstaged[i],
+                                depth,
+                                width,
+                                theme,
+                                false,
+                                row_hovered,
+                                hovered_action,
+                            )
+                        } else {
+                            file_item(
+                                &self.repos[r].status.unstaged[i],
+                                width,
+                                theme,
+                                false,
+                                row_hovered,
+                                hovered_action,
+                            )
+                        }
                     }
                 };
                 if selected == Some(i) {
@@ -3949,6 +4410,7 @@ impl App {
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
         let mut hints: Vec<(&'static str, &'static str)> = vec![
             ("⏎", "stage"),
+            ("t", if self.tree_view { "list" } else { "tree" }),
             ("a", "all"),
             ("u", "none"),
             ("c", "msg"),
@@ -4523,6 +4985,113 @@ fn file_item(
     ListItem::new(Line::from(spans))
 }
 
+fn dir_hover_action_at(x: u16, width: u16, staged: bool, count: usize) -> Option<FileHoverAction> {
+    if width < 10 {
+        return None;
+    }
+    let badge_len = format!(" ({count}) ").len() as u16;
+    let action_end = width.saturating_sub(badge_len);
+    let action_start = action_end.saturating_sub(3);
+    if x >= action_start && x < action_end {
+        Some(if staged {
+            FileHoverAction::Unstage
+        } else {
+            FileHoverAction::Stage
+        })
+    } else {
+        None
+    }
+}
+
+fn tree_file_item(
+    entry: &FileEntry,
+    depth: usize,
+    width: usize,
+    theme: IconTheme,
+    staged: bool,
+    hovered: bool,
+    hovered_action: Option<FileHoverAction>,
+) -> ListItem<'static> {
+    let name = match entry.path.rsplit_once('/') {
+        Some((_, name)) => name,
+        None => entry.path.as_str(),
+    };
+    let color = status_color(entry.letter);
+    let file_icon = icon(theme, name, false, false);
+    let icon_style = ui_icon_style(file_icon.rgb);
+    let indent = "  ".repeat(depth);
+    let mut spans = vec![
+        Span::raw(format!(" {indent}  ")),
+        Span::styled(format!("{} ", file_icon.glyph), icon_style),
+    ];
+    let actions = file_hover_actions(staged);
+    let show_actions = hovered && file_hover_action_start(width as u16, staged).is_some();
+    let actions_width = usize::from(show_actions) * actions.len() * 3;
+    let tail = 2 + actions_width;
+    let prefix_width: usize = spans.iter().map(Span::width).sum();
+    let content_width = width.saturating_sub(prefix_width + tail);
+    let visible_name = truncate_to(name.to_string(), content_width);
+    spans.push(Span::styled(visible_name, Style::default().fg(color)));
+    let letter = Span::styled(entry.letter.to_string(), Style::default().fg(color).bold());
+    let left_width: usize = spans.iter().map(Span::width).sum();
+    let pad = width.saturating_sub(left_width + tail);
+    spans.push(Span::raw(" ".repeat(pad)));
+    if show_actions {
+        for action in actions {
+            spans.push(Span::styled(
+                format!(" {} ", action.glyph()),
+                chrome_button_style(hovered_action == Some(*action)),
+            ));
+        }
+    }
+    spans.push(letter);
+    spans.push(Span::raw(" "));
+    ListItem::new(Line::from(spans))
+}
+
+fn tree_dir_item(
+    dir: &DirEntry,
+    width: usize,
+    theme: IconTheme,
+    staged: bool,
+    hovered: bool,
+    hovered_action: Option<FileHoverAction>,
+) -> ListItem<'static> {
+    let indent = "  ".repeat(dir.depth);
+    let arrow = if dir.expanded { "▾ " } else { "▸ " };
+    let folder_icon = icon(theme, &dir.name, true, dir.expanded);
+    let icon_style = ui_icon_style(folder_icon.rgb);
+    let mut spans = vec![
+        Span::styled(format!(" {indent}{arrow}"), Style::default().dim()),
+        Span::styled(format!("{} ", folder_icon.glyph), icon_style),
+    ];
+    let action = if staged {
+        FileHoverAction::Unstage
+    } else {
+        FileHoverAction::Stage
+    };
+    let show_action = hovered && width >= 10;
+    let action_width = if show_action { 3 } else { 0 };
+    let badge_str = format!(" ({})", dir.count);
+    let tail = 2 + action_width + badge_str.len();
+    let prefix_width: usize = spans.iter().map(Span::width).sum();
+    let content_width = width.saturating_sub(prefix_width + tail);
+    let visible_name = truncate_to(dir.name.clone(), content_width);
+    spans.push(Span::styled(visible_name, Style::default().bold()));
+    let left_width: usize = spans.iter().map(Span::width).sum();
+    let pad = width.saturating_sub(left_width + tail);
+    spans.push(Span::raw(" ".repeat(pad)));
+    if show_action {
+        spans.push(Span::styled(
+            format!(" {} ", action.glyph()),
+            chrome_button_style(hovered_action == Some(action)),
+        ));
+    }
+    spans.push(Span::styled(badge_str, Style::default().dim()));
+    spans.push(Span::raw(" "));
+    ListItem::new(Line::from(spans))
+}
+
 fn pane_focused_in(pane_list_json: &str, pane_id: &str) -> bool {
     let Ok(value) =
         serde_json::from_str::<serde_json::Value>(pane_list_json.trim_start_matches('\u{feff}'))
@@ -4814,5 +5383,114 @@ mod tests {
                 "Tags"
             ]
         );
+    }
+
+    #[test]
+    fn build_tree_model_compacts_single_child_directories() {
+        let files = vec![
+            FileEntry {
+                path: "deep/nested/subfolder/file1.rs".into(),
+                orig: None,
+                letter: 'M',
+            },
+            FileEntry {
+                path: "deep/nested/subfolder/file2.rs".into(),
+                orig: None,
+                letter: 'A',
+            },
+            FileEntry {
+                path: "other/single.txt".into(),
+                orig: None,
+                letter: '?',
+            },
+        ];
+
+        let collapsed = std::collections::BTreeSet::new();
+        let (dirs, file_depths, tree_rows) = build_tree_model(&files, &collapsed);
+
+        // "deep/nested/subfolder" has 1 child ("nested"), which has 1 child ("subfolder"),
+        // which has 2 files. So "deep/nested/subfolder" is compacted into one DirEntry.
+        assert_eq!(dirs.len(), 2);
+        assert_eq!(dirs[0].name, "deep/nested/subfolder");
+        assert_eq!(dirs[0].path, "deep/nested/subfolder");
+        assert_eq!(dirs[0].count, 2);
+        assert_eq!(dirs[0].depth, 0);
+
+        assert_eq!(dirs[1].name, "other");
+        assert_eq!(dirs[1].path, "other");
+        assert_eq!(dirs[1].count, 1);
+        assert_eq!(dirs[1].depth, 0);
+
+        // Rows when nothing is collapsed:
+        // Dir(0) "deep/nested/subfolder"
+        // File(0) "file1.rs" (depth 1)
+        // File(1) "file2.rs" (depth 1)
+        // Dir(1) "other"
+        // File(2) "single.txt" (depth 1)
+        assert_eq!(tree_rows.len(), 5);
+        assert_eq!(tree_rows[0], TreeItem::Dir(0));
+        assert_eq!(tree_rows[1], TreeItem::File(0));
+        assert_eq!(tree_rows[2], TreeItem::File(1));
+        assert_eq!(tree_rows[3], TreeItem::Dir(1));
+        assert_eq!(tree_rows[4], TreeItem::File(2));
+
+        assert_eq!(file_depths[0], 1);
+        assert_eq!(file_depths[1], 1);
+        assert_eq!(file_depths[2], 1);
+    }
+
+    #[test]
+    fn build_tree_model_respects_collapsed_directories() {
+        let files = vec![
+            FileEntry {
+                path: "src/a.rs".into(),
+                orig: None,
+                letter: 'M',
+            },
+            FileEntry {
+                path: "src/b.rs".into(),
+                orig: None,
+                letter: 'M',
+            },
+            FileEntry {
+                path: "root.txt".into(),
+                orig: None,
+                letter: 'A',
+            },
+        ];
+
+        let mut collapsed = std::collections::BTreeSet::new();
+        collapsed.insert("src".to_string());
+
+        let (dirs, file_depths, tree_rows) = build_tree_model(&files, &collapsed);
+
+        assert_eq!(dirs.len(), 1);
+        assert_eq!(dirs[0].name, "src");
+        assert_eq!(dirs[0].count, 2);
+
+        // Children of "src" should be hidden since "src" is collapsed
+        // Expected tree_rows: Dir(0) "src", File(2) "root.txt"
+        assert_eq!(tree_rows.len(), 2);
+        assert_eq!(tree_rows[0], TreeItem::Dir(0));
+        assert_eq!(tree_rows[1], TreeItem::File(2));
+        assert_eq!(file_depths[2], 0);
+    }
+
+    #[test]
+    fn dir_hover_action_hit_testing() {
+        // In width 40 with count 3:
+        // Columns 32..35 are the stage/unstage button, 35..39 is the count badge " (3)", and 39 is trailing space.
+        let action = dir_hover_action_at(33, 40, true, 3);
+        assert_eq!(action, Some(FileHoverAction::Unstage));
+
+        let action_unstaged = dir_hover_action_at(33, 40, false, 3);
+        assert_eq!(action_unstaged, Some(FileHoverAction::Stage));
+
+        // Click on count badge or directory name should return None
+        let action_badge = dir_hover_action_at(38, 40, true, 3);
+        assert_eq!(action_badge, None);
+
+        let action_left = dir_hover_action_at(10, 40, true, 3);
+        assert_eq!(action_left, None);
     }
 }
